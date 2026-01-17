@@ -18,6 +18,7 @@ class Pipe:
             default="ag_"
         )  # Your Agent ID aqui or put in var, please, use VAR!
         FILES_URL_EXPIRY_HOURS: int = Field(default=24)
+        PASSTHROUGH_OPENWEBUI_TOOLS: bool = Field(default=False)
 
     def __init__(self):
         self.type = "manifold"
@@ -47,18 +48,24 @@ class Pipe:
             "max_tokens",
             "metadata",
             "n",
-            "parallel_tool_calls",
             "prediction",
             "presence_penalty",
             "prompt_mode",
             "random_seed",
             "response_format",
             "stop",
-            "tool_choice",
-            "tools",
             "temperature",
             "top_p",
         ]
+
+        if self.valves.PASSTHROUGH_OPENWEBUI_TOOLS:
+            extra_passthrough_keys.extend(
+                [
+                    "parallel_tool_calls",
+                    "tool_choice",
+                    "tools",
+                ]
+            )
         for key in extra_passthrough_keys:
             if key in body:
                 payload[key] = body[key]
@@ -182,7 +189,11 @@ class Pipe:
             return {}
 
         first = choices[0] or {}
-        return first.get("message") or {}
+        message = first.get("message") or {}
+        if isinstance(message, dict) and "tool_calls" in message:
+            message = {**message}
+            message.pop("tool_calls", None)
+        return message
 
     def _extract_text_references_files(
         self, message: dict
@@ -231,6 +242,10 @@ class Pipe:
                 new_choices.append(choice)
                 continue
 
+            new_delta_base = {**delta}
+            if "tool_calls" in new_delta_base:
+                new_delta_base.pop("tool_calls", None)
+
             content = delta.get("content")
             if isinstance(content, list):
                 text_parts: List[str] = []
@@ -247,13 +262,14 @@ class Pipe:
                     elif chunk_type == "tool_file":
                         collected_files.append(chunk)
 
-                new_delta = {**delta}
+                new_delta = new_delta_base
                 new_text = "".join(text_parts)
                 new_delta["content"] = new_text if new_text else ""
                 new_choice = {**choice, "delta": new_delta}
                 new_choices.append(new_choice)
             else:
-                new_choices.append(choice)
+                new_choice = {**choice, "delta": new_delta_base}
+                new_choices.append(new_choice)
 
         new_event["choices"] = new_choices
         return new_event, collected_refs, collected_files
