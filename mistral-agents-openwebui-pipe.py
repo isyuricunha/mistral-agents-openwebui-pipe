@@ -1,7 +1,7 @@
 # title: Mistral Agents
 # author: Yuri Cunha
 # version: 1.4.0
-# license: MIT
+# license: AGPL-3.0
 
 import requests
 import json
@@ -24,6 +24,10 @@ class Pipe:
         HTTP_MAX_RETRIES: int = Field(default=3)
         HTTP_BACKOFF_BASE_SECONDS: float = Field(default=1.0)
         HTTP_BACKOFF_MAX_SECONDS: float = Field(default=20.0)
+        DEBUG_RATE_LIMIT: bool = Field(default=False)
+        MIN_SECONDS_BETWEEN_CONVERSATION_CALLS: float = Field(default=0.0)
+        COOLDOWN_SECONDS_AFTER_IMAGE: float = Field(default=0.0)
+        COOLDOWN_SECONDS_ON_429: float = Field(default=10.0)
 
     def __init__(self):
         self.type = "manifold"
@@ -35,11 +39,21 @@ class Pipe:
         self.conversations_append_endpoint = "https://api.mistral.ai/v1/conversations/{conversation_id}"
         self.files_url_endpoint = "https://api.mistral.ai/v1/files/{file_id}/url"
         self._conversation_ids_by_chat_id: Dict[str, str] = {}
+        self._last_conversation_call_ts_by_chat_id: Dict[str, float] = {}
+        self._cooldown_until_ts_by_chat_id: Dict[str, float] = {}
+        self._global_cooldown_until_ts: float = 0.0
 
     def pipes(self) -> List[Dict[str, str]]:
         return [{"id": "agent", "name": f"Mistral Agent ({self.valves.AGENT_ID[:10]})"}]
 
     def pipe(self, body: dict, __user__: Optional[dict] = None) -> Union[str, Generator[bytes, None, None], dict]:
+        local_text = self._get_last_user_text(body)
+        remaining = self._get_global_cooldown_remaining_seconds()
+        if remaining > 0:
+            if self._is_rate_limit_question(local_text):
+                return self._local_rate_limit_explanation(remaining)
+            return self._local_cooldown_message(remaining)
+
         headers = {
             "Authorization": f"Bearer {self.valves.MISTRAL_API_KEY}",
             "Content-Type": "application/json",
@@ -92,6 +106,62 @@ class Pipe:
             return self._non_stream_conversation_completion(headers=headers, body=body)
         return self._non_stream_agent_completion(headers=headers, payload=payload)
 
+    def _get_last_user_text(self, body: dict) -> str:
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return ""
+
+        for msg in reversed(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                return content
+            return str(content)
+        return ""
+
+    def _is_rate_limit_question(self, text: str) -> bool:
+        t = (text or "").lower()
+        triggers = [
+            "erro 429",
+            "error 429",
+            "429",
+            "rate limit",
+            "too many requests",
+            "limite",
+            "limitação",
+            "limite de taxa",
+        ]
+        return any(x in t for x in triggers)
+
+    def _get_global_cooldown_remaining_seconds(self) -> int:
+        now = time.monotonic()
+        remaining = self._global_cooldown_until_ts - now
+        return int(remaining) + 1 if remaining > 0 else 0
+
+    def _set_global_cooldown_seconds(self, seconds: float) -> None:
+        seconds = max(0.0, float(seconds))
+        if seconds <= 0:
+            return
+        until = time.monotonic() + seconds
+        self._global_cooldown_until_ts = max(
+            self._global_cooldown_until_ts, until)
+        if self.valves.DEBUG_RATE_LIMIT:
+            print(f"[mistral-rl] global cooldown seconds={seconds:.2f}")
+
+    def _local_cooldown_message(self, remaining_seconds: int) -> str:
+        return (
+            f"Rate limit da Mistral atingido (HTTP 429). "
+            f"Aguarde ~{remaining_seconds}s e tente novamente."
+        )
+
+    def _local_rate_limit_explanation(self, remaining_seconds: int) -> str:
+        return (
+            "HTTP 429 (Too Many Requests) significa que você excedeu o limite de requisições/tokens "
+            "do seu workspace na Mistral (rate limit). "
+            f"Neste momento, aguarde ~{remaining_seconds}s e tente de novo."
+        )
+
     def _extract_last_user_input(self, body: dict) -> Union[str, List[dict]]:
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
@@ -124,6 +194,9 @@ class Pipe:
 
         for attempt in range(max_retries + 1):
             try:
+                if self.valves.DEBUG_RATE_LIMIT:
+                    print(f"[mistral-http] {method} {url} attempt={attempt}")
+
                 r = requests.request(
                     method=method,
                     url=url,
@@ -134,9 +207,23 @@ class Pipe:
                     stream=stream,
                 )
 
+                if self.valves.DEBUG_RATE_LIMIT:
+                    print(f"[mistral-http] status={r.status_code} url={url}")
+
                 if r.status_code != 429:
                     r.raise_for_status()
                     return r
+
+                if self.valves.DEBUG_RATE_LIMIT:
+                    retry_after_header = r.headers.get("Retry-After")
+                    ratelimit_headers = {
+                        k: v
+                        for k, v in r.headers.items()
+                        if k.lower().startswith("x-ratelimit") or k.lower() == "retry-after"
+                    }
+                    print(
+                        f"[mistral-http] 429 url={url} retry-after={retry_after_header} headers={ratelimit_headers}"
+                    )
 
                 retry_after = r.headers.get("Retry-After")
                 sleep_seconds: float
@@ -148,6 +235,12 @@ class Pipe:
                 else:
                     sleep_seconds = float(
                         self.valves.HTTP_BACKOFF_BASE_SECONDS) * (2**attempt)
+
+                cooldown_seconds = sleep_seconds
+                if cooldown_seconds <= 0:
+                    cooldown_seconds = float(
+                        self.valves.COOLDOWN_SECONDS_ON_429 or 0.0)
+                self._set_global_cooldown_seconds(cooldown_seconds)
 
                 sleep_seconds = min(
                     float(self.valves.HTTP_BACKOFF_MAX_SECONDS), max(0.0, sleep_seconds))
@@ -178,8 +271,45 @@ class Pipe:
             return f"HTTP {status}: {e.response.text[:500]}"
         return str(e)
 
+    def _apply_conversation_rate_limit(self, body: dict) -> None:
+        chat_id = body.get("chat_id")
+        if not isinstance(chat_id, str) or not chat_id:
+            return
+
+        now = time.monotonic()
+
+        cooldown_until = self._cooldown_until_ts_by_chat_id.get(chat_id, 0.0)
+        if cooldown_until > now:
+            wait_seconds = cooldown_until - now
+            if self.valves.DEBUG_RATE_LIMIT:
+                print(
+                    f"[mistral-rl] cooldown chat_id={chat_id} sleep={wait_seconds:.2f}s")
+            time.sleep(wait_seconds)
+            now = time.monotonic()
+
+        min_interval = float(
+            self.valves.MIN_SECONDS_BETWEEN_CONVERSATION_CALLS or 0.0)
+        if min_interval <= 0:
+            return
+
+        last_ts = self._last_conversation_call_ts_by_chat_id.get(chat_id)
+        if last_ts is None:
+            return
+
+        elapsed = now - last_ts
+        if elapsed >= min_interval:
+            return
+
+        wait_seconds = min_interval - elapsed
+        if self.valves.DEBUG_RATE_LIMIT:
+            print(
+                f"[mistral-rl] min-interval chat_id={chat_id} sleep={wait_seconds:.2f}s")
+        time.sleep(wait_seconds)
+
     def _start_conversation(self, headers: dict, body: dict) -> dict:
         chat_id = body.get("chat_id")
+
+        self._apply_conversation_rate_limit(body)
 
         inputs = self._extract_last_user_input(body)
         if not inputs:
@@ -207,12 +337,19 @@ class Pipe:
             timeout=180,
         )
         data = r.json()
+
+        if isinstance(chat_id, str) and chat_id:
+            self._last_conversation_call_ts_by_chat_id[chat_id] = time.monotonic(
+            )
         conv_id = data.get("conversation_id")
         if isinstance(conv_id, str) and isinstance(chat_id, str) and chat_id:
             self._conversation_ids_by_chat_id[chat_id] = conv_id
-        return data if isinstance(data, dict) else {}
+        return data
 
     def _append_conversation(self, headers: dict, conversation_id: str, body: dict) -> dict:
+        chat_id = body.get("chat_id")
+
+        self._apply_conversation_rate_limit(body)
         inputs = self._extract_last_user_input(body)
         if not inputs:
             return {}
@@ -243,7 +380,10 @@ class Pipe:
         )
         data = r.json()
 
-        chat_id = body.get("chat_id")
+        if isinstance(chat_id, str) and chat_id:
+            self._last_conversation_call_ts_by_chat_id[chat_id] = time.monotonic(
+            )
+
         new_conv_id = data.get("conversation_id")
         if isinstance(chat_id, str) and chat_id and isinstance(new_conv_id, str) and new_conv_id:
             self._conversation_ids_by_chat_id[chat_id] = new_conv_id
@@ -293,6 +433,15 @@ class Pipe:
 
             text, references, file_chunks = self._extract_from_conversation_response(
                 data)
+
+            if isinstance(chat_id, str) and chat_id and file_chunks and float(self.valves.COOLDOWN_SECONDS_AFTER_IMAGE or 0.0) > 0:
+                self._cooldown_until_ts_by_chat_id[chat_id] = time.monotonic(
+                ) + float(self.valves.COOLDOWN_SECONDS_AFTER_IMAGE)
+                if self.valves.DEBUG_RATE_LIMIT:
+                    print(
+                        f"[mistral-rl] image cooldown chat_id={chat_id} seconds={float(self.valves.COOLDOWN_SECONDS_AFTER_IMAGE):.2f}"
+                    )
+
             extra = self._build_extra_markdown(
                 headers=headers, references=references, file_chunks=file_chunks)
             if extra:
@@ -412,7 +561,7 @@ class Pipe:
                 "data: "
                 + json.dumps(
                     {
-                        "error": {"message": str(e), "type": "pipe_error"},
+                        "error": {"message": self._format_http_error(e), "type": "pipe_error"},
                         "object": "error",
                     },
                     ensure_ascii=False,
