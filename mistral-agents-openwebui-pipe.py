@@ -1,12 +1,13 @@
 # title: Mistral Agents
 # author: Yuri Cunha
-# version: 1.3.0
+# version: 1.4.0
 # license: MIT
 
 import requests
 import json
 import base64
 import mimetypes
+import time
 from typing import List, Dict, Generator, Iterator, Optional, Tuple, Union
 from pydantic import BaseModel, Field
 
@@ -20,6 +21,9 @@ class Pipe:
         FILES_URL_EXPIRY_HOURS: int = Field(default=24)
         PASSTHROUGH_OPENWEBUI_TOOLS: bool = Field(default=False)
         USE_BETA_CONVERSATIONS: bool = Field(default=True)
+        HTTP_MAX_RETRIES: int = Field(default=3)
+        HTTP_BACKOFF_BASE_SECONDS: float = Field(default=1.0)
+        HTTP_BACKOFF_MAX_SECONDS: float = Field(default=20.0)
 
     def __init__(self):
         self.type = "manifold"
@@ -105,6 +109,75 @@ class Pipe:
         content = last_user.get("content", "")
         return [{"role": "user", "content": content}]
 
+    def _request_with_retries(
+        self,
+        method: str,
+        url: str,
+        headers: dict,
+        json_payload: Optional[dict],
+        params: Optional[dict],
+        timeout: int,
+        stream: bool = False,
+    ) -> requests.Response:
+        last_exc: Optional[Exception] = None
+        max_retries = max(0, int(self.valves.HTTP_MAX_RETRIES))
+
+        for attempt in range(max_retries + 1):
+            try:
+                r = requests.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    params=params,
+                    json=json_payload,
+                    timeout=timeout,
+                    stream=stream,
+                )
+
+                if r.status_code != 429:
+                    r.raise_for_status()
+                    return r
+
+                retry_after = r.headers.get("Retry-After")
+                sleep_seconds: float
+                if retry_after:
+                    try:
+                        sleep_seconds = float(retry_after)
+                    except ValueError:
+                        sleep_seconds = self.valves.HTTP_BACKOFF_BASE_SECONDS
+                else:
+                    sleep_seconds = float(
+                        self.valves.HTTP_BACKOFF_BASE_SECONDS) * (2**attempt)
+
+                sleep_seconds = min(
+                    float(self.valves.HTTP_BACKOFF_MAX_SECONDS), max(0.0, sleep_seconds))
+                if attempt >= max_retries:
+                    r.raise_for_status()
+                time.sleep(sleep_seconds)
+
+            except Exception as e:
+                last_exc = e
+                if attempt >= max_retries:
+                    raise
+                sleep_seconds = float(
+                    self.valves.HTTP_BACKOFF_BASE_SECONDS) * (2**attempt)
+                sleep_seconds = min(
+                    float(self.valves.HTTP_BACKOFF_MAX_SECONDS), max(0.0, sleep_seconds))
+                time.sleep(sleep_seconds)
+
+        raise RuntimeError(last_exc) if last_exc else RuntimeError(
+            "Request failed")
+
+    def _format_http_error(self, e: Exception) -> str:
+        if isinstance(e, requests.HTTPError) and e.response is not None:
+            status = e.response.status_code
+            if status == 429:
+                retry_after = e.response.headers.get("Retry-After")
+                hint = f" Retry after {retry_after}s." if retry_after else ""
+                return f"Rate limit hit (HTTP 429). Please wait a bit and try again.{hint}"
+            return f"HTTP {status}: {e.response.text[:500]}"
+        return str(e)
+
     def _start_conversation(self, headers: dict, body: dict) -> dict:
         chat_id = body.get("chat_id")
 
@@ -125,13 +198,14 @@ class Pipe:
         if completion_args:
             payload["completion_args"] = completion_args
 
-        r = requests.post(
-            self.conversations_start_endpoint,
+        r = self._request_with_retries(
+            method="POST",
+            url=self.conversations_start_endpoint,
             headers=headers,
-            json=payload,
+            json_payload=payload,
+            params=None,
             timeout=180,
         )
-        r.raise_for_status()
         data = r.json()
         conv_id = data.get("conversation_id")
         if isinstance(conv_id, str) and isinstance(chat_id, str) and chat_id:
@@ -159,8 +233,14 @@ class Pipe:
 
         url = self.conversations_append_endpoint.format(
             conversation_id=conversation_id)
-        r = requests.post(url, headers=headers, json=payload, timeout=180)
-        r.raise_for_status()
+        r = self._request_with_retries(
+            method="POST",
+            url=url,
+            headers=headers,
+            json_payload=payload,
+            params=None,
+            timeout=180,
+        )
         data = r.json()
 
         chat_id = body.get("chat_id")
@@ -219,7 +299,7 @@ class Pipe:
                 text = f"{text}\n\n{extra}" if text else extra
             return text
         except Exception as e:
-            return f"Error: {e}"
+            return f"Error: {self._format_http_error(e)}"
 
     def _stream_conversation_completion(self, headers: dict, body: dict) -> Generator[bytes, None, None]:
         try:
@@ -248,7 +328,7 @@ class Pipe:
                 "data: "
                 + json.dumps(
                     {
-                        "error": {"message": str(e), "type": "pipe_error"},
+                        "error": {"message": self._format_http_error(e), "type": "pipe_error"},
                         "object": "error",
                     },
                     ensure_ascii=False,
@@ -259,14 +339,14 @@ class Pipe:
 
     def _non_stream_agent_completion(self, headers: dict, payload: dict) -> str:
         try:
-            response = requests.post(
-                self.agents_endpoint,
+            response = self._request_with_retries(
+                method="POST",
+                url=self.agents_endpoint,
                 headers=headers,
-                json=payload,
+                json_payload=payload,
+                params=None,
                 timeout=120,
             )
-            response.raise_for_status()
-
             data = response.json()
             message = self._extract_message_from_completion(data)
             text, references, file_chunks = self._extract_text_references_files(
@@ -277,21 +357,22 @@ class Pipe:
                 text = f"{text}\n\n{extra}" if text else extra
             return text
         except Exception as e:
-            return f"Error: {e}"
+            return f"Error: {self._format_http_error(e)}"
 
     def _stream_agent_completion(self, headers: dict, payload: dict) -> Generator[bytes, None, None]:
         references: List[dict] = []
         file_chunks: List[dict] = []
 
         try:
-            response = requests.post(
-                self.agents_endpoint,
+            response = self._request_with_retries(
+                method="POST",
+                url=self.agents_endpoint,
                 headers=headers,
-                json=payload,
-                stream=True,
+                json_payload=payload,
+                params=None,
                 timeout=120,
+                stream=True,
             )
-            response.raise_for_status()
 
             for event in self._iter_sse_events(response):
                 if event is None:
@@ -521,8 +602,14 @@ class Pipe:
         try:
             url = self.files_url_endpoint.format(file_id=file_id)
             params = {"expiry": int(self.valves.FILES_URL_EXPIRY_HOURS)}
-            r = requests.get(url, headers=headers, params=params, timeout=60)
-            r.raise_for_status()
+            r = self._request_with_retries(
+                method="GET",
+                url=url,
+                headers=headers,
+                json_payload=None,
+                params=params,
+                timeout=60,
+            )
             data = r.json()
             signed = data.get("url")
             return signed if isinstance(signed, str) else ""
@@ -536,8 +623,14 @@ class Pipe:
                 return ""
 
             content_url = f"https://api.mistral.ai/v1/files/{file_id}/content"
-            r = requests.get(content_url, headers=headers, timeout=120)
-            r.raise_for_status()
+            r = self._request_with_retries(
+                method="GET",
+                url=content_url,
+                headers=headers,
+                json_payload=None,
+                params=None,
+                timeout=120,
+            )
             file_bytes = r.content
 
             file_name = chunk.get("file_name")
