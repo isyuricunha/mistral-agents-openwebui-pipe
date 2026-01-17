@@ -7,7 +7,7 @@ import requests
 import json
 import base64
 import mimetypes
-from typing import List, Dict, Generator, Iterator, Optional, Tuple, Any, Union
+from typing import List, Dict, Generator, Iterator, Optional, Tuple, Union
 from pydantic import BaseModel, Field
 
 
@@ -19,6 +19,7 @@ class Pipe:
         )  # Your Agent ID aqui or put in var, please, use VAR!
         FILES_URL_EXPIRY_HOURS: int = Field(default=24)
         PASSTHROUGH_OPENWEBUI_TOOLS: bool = Field(default=False)
+        USE_BETA_CONVERSATIONS: bool = Field(default=True)
 
     def __init__(self):
         self.type = "manifold"
@@ -26,7 +27,10 @@ class Pipe:
         self.name = "mistral-agent/"
         self.valves = self.Valves()
         self.agents_endpoint = "https://api.mistral.ai/v1/agents/completions"
+        self.conversations_start_endpoint = "https://api.mistral.ai/v1/conversations"
+        self.conversations_append_endpoint = "https://api.mistral.ai/v1/conversations/{conversation_id}"
         self.files_url_endpoint = "https://api.mistral.ai/v1/files/{file_id}/url"
+        self._conversation_ids_by_chat_id: Dict[str, str] = {}
 
     def pipes(self) -> List[Dict[str, str]]:
         return [{"id": "agent", "name": f"Mistral Agent ({self.valves.AGENT_ID[:10]})"}]
@@ -76,9 +80,182 @@ class Pipe:
             return "Error: AGENT_ID is not configured in valves."
 
         if payload["stream"]:
+            if self.valves.USE_BETA_CONVERSATIONS:
+                return self._stream_conversation_completion(headers=headers, body=body)
             return self._stream_agent_completion(headers=headers, payload=payload)
 
+        if self.valves.USE_BETA_CONVERSATIONS:
+            return self._non_stream_conversation_completion(headers=headers, body=body)
         return self._non_stream_agent_completion(headers=headers, payload=payload)
+
+    def _extract_last_user_input(self, body: dict) -> Union[str, List[dict]]:
+        messages = body.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return ""
+
+        last_user = None
+        for msg in reversed(messages):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                last_user = msg
+                break
+
+        if not isinstance(last_user, dict):
+            return ""
+
+        content = last_user.get("content", "")
+        return [{"role": "user", "content": content}]
+
+    def _start_conversation(self, headers: dict, body: dict) -> dict:
+        chat_id = body.get("chat_id")
+
+        inputs = self._extract_last_user_input(body)
+        if not inputs:
+            return {}
+
+        payload: dict = {
+            "agent_id": self.valves.AGENT_ID,
+            "inputs": inputs,
+            "stream": False,
+        }
+
+        completion_args: dict = {}
+        for k in ["temperature", "top_p", "max_tokens", "stop", "random_seed", "presence_penalty", "frequency_penalty"]:
+            if k in body:
+                completion_args[k] = body[k]
+        if completion_args:
+            payload["completion_args"] = completion_args
+
+        r = requests.post(
+            self.conversations_start_endpoint,
+            headers=headers,
+            json=payload,
+            timeout=180,
+        )
+        r.raise_for_status()
+        data = r.json()
+        conv_id = data.get("conversation_id")
+        if isinstance(conv_id, str) and isinstance(chat_id, str) and chat_id:
+            self._conversation_ids_by_chat_id[chat_id] = conv_id
+        return data if isinstance(data, dict) else {}
+
+    def _append_conversation(self, headers: dict, conversation_id: str, body: dict) -> dict:
+        inputs = self._extract_last_user_input(body)
+        if not inputs:
+            return {}
+
+        payload: dict = {
+            "inputs": inputs,
+            "stream": False,
+            "store": True,
+            "handoff_execution": "server",
+        }
+
+        completion_args: dict = {}
+        for k in ["temperature", "top_p", "max_tokens", "stop", "random_seed", "presence_penalty", "frequency_penalty"]:
+            if k in body:
+                completion_args[k] = body[k]
+        if completion_args:
+            payload["completion_args"] = completion_args
+
+        url = self.conversations_append_endpoint.format(
+            conversation_id=conversation_id)
+        r = requests.post(url, headers=headers, json=payload, timeout=180)
+        r.raise_for_status()
+        data = r.json()
+
+        chat_id = body.get("chat_id")
+        new_conv_id = data.get("conversation_id")
+        if isinstance(chat_id, str) and chat_id and isinstance(new_conv_id, str) and new_conv_id:
+            self._conversation_ids_by_chat_id[chat_id] = new_conv_id
+
+        return data
+
+    def _extract_from_conversation_response(self, data: dict) -> Tuple[str, List[dict], List[dict]]:
+        outputs = data.get("outputs")
+        if not isinstance(outputs, list) or not outputs:
+            return "", [], []
+
+        last_message_output = None
+        for entry in reversed(outputs):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("type") == "message.output" and entry.get("role") == "assistant":
+                last_message_output = entry
+                break
+
+        if not isinstance(last_message_output, dict):
+            for entry in reversed(outputs):
+                if isinstance(entry, dict) and entry.get("type") == "message.output":
+                    last_message_output = entry
+                    break
+
+        if not isinstance(last_message_output, dict):
+            return "", [], []
+
+        text, references, file_chunks = self._extract_text_references_files(
+            last_message_output)
+        return text, references, file_chunks
+
+    def _non_stream_conversation_completion(self, headers: dict, body: dict) -> str:
+        try:
+            chat_id = body.get("chat_id")
+            conversation_id = ""
+            if isinstance(chat_id, str) and chat_id in self._conversation_ids_by_chat_id:
+                conversation_id = self._conversation_ids_by_chat_id[chat_id]
+
+            if conversation_id:
+                data = self._append_conversation(
+                    headers=headers, conversation_id=conversation_id, body=body)
+            else:
+                data = self._start_conversation(headers=headers, body=body)
+                if not isinstance(data, dict) or not data.get("conversation_id"):
+                    return "Error: Could not start a Mistral conversation."
+
+            text, references, file_chunks = self._extract_from_conversation_response(
+                data)
+            extra = self._build_extra_markdown(
+                headers=headers, references=references, file_chunks=file_chunks)
+            if extra:
+                text = f"{text}\n\n{extra}" if text else extra
+            return text
+        except Exception as e:
+            return f"Error: {e}"
+
+    def _stream_conversation_completion(self, headers: dict, body: dict) -> Generator[bytes, None, None]:
+        try:
+            # To reliably include images and sources, we execute non-stream and emulate OpenAI SSE.
+            text = self._non_stream_conversation_completion(
+                headers=headers, body=body)
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "delta": {"content": text},
+                                "index": 0,
+                            }
+                        ],
+                        "object": "chat.completion.chunk",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            ).encode("utf-8")
+            yield b"data: [DONE]\n\n"
+        except Exception as e:
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "error": {"message": str(e), "type": "pipe_error"},
+                        "object": "error",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            ).encode("utf-8")
+            yield b"data: [DONE]\n\n"
 
     def _non_stream_agent_completion(self, headers: dict, payload: dict) -> str:
         try:
